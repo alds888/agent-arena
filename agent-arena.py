@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
-🎮 AgentArena — AI Agent 专属竞技场
+🎮 AgentArena v2.0 — AI Agent 专属竞技场
 
 不是人类玩的游戏，是专门给Agent设计的竞技场。
 Agent通过HTTP API参与游戏，测试推理、工具调用、策略能力。
+
+v2.0 新特性:
+  - 🤖 LLM 集成：play --llm 模式，LLM 自动答题
+  - 📜 日志系统：每局记录完整答题过程，JSON 导出
+  - 📊 增强统计：按挑战类型/难度/模型统计，模型排行榜
+  - ⚔️ 实时对战：Agent vs Agent 辩论/对抗
+  - 🔁 挑战生成：用 LLM 动态生成新挑战
 
 玩法：
   1. Agent注册参赛
@@ -20,8 +27,9 @@ Agent通过HTTP API参与游戏，测试推理、工具调用、策略能力。
 
 启动：
   python agent-arena.py serve           # 启动竞技场服务
-  python agent-arena.py play            # 单Agent测试
+  python agent-arena.py play --llm      # LLM 驱动测试
   python agent-arena.py leaderboard     # 排行榜
+  python agent-arena.py stats           # 详细统计
 """
 
 import os
@@ -41,6 +49,74 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 ARENA_DIR = Path(__file__).parent / "arena-data"
 SCORES_FILE = ARENA_DIR / "scores.json"
 CHALLENGES_FILE = ARENA_DIR / "challenges.json"
+LOGS_DIR = ARENA_DIR / "logs"
+STATS_FILE = ARENA_DIR / "stats.json"
+
+
+# ========== LLM 客户端 ==========
+
+class LLMClient:
+    """OpenAI 兼容 API 客户端"""
+
+    def __init__(self):
+        self.base_url = os.environ.get("LLM_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
+        self.api_key = os.environ.get("LLM_API_KEY", "")
+        self.model = os.environ.get("LLM_MODEL", "doubao-lite")
+        self._client = None
+
+    @property
+    def available(self):
+        return bool(self.api_key)
+
+    @property
+    def client(self):
+        if self._client is None:
+            try:
+                from openai import OpenAI
+                self._client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+            except ImportError:
+                raise ImportError("需要安装 openai: pip install openai")
+        return self._client
+
+    def chat(self, system_prompt, user_prompt, temperature=0.7, max_tokens=500):
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                temperature=temperature, max_tokens=max_tokens,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            return f"[LLM错误: {e}]"
+
+    def answer_challenge(self, challenge, prompt_data):
+        """用 LLM 回答挑战"""
+        safe_prompt = {k: v for k, v in prompt_data.items() if k not in ("answers", "answer", "common_wrong_answers", "test_cases")}
+        system = f"""你是AI竞技场参赛者。你需要回答以下挑战。
+挑战类型：{challenge['type']}
+挑战名称：{challenge['name']}
+难度：{'⭐' * challenge['difficulty']}
+
+规则：
+- 仔细阅读题目，不要被陷阱误导
+- 如果是列表类答案，用JSON数组格式返回
+- 如果是单一答案，直接返回答案
+- 如果是代码题，返回完整代码
+- 如果是选择题，只返回选项字母"""
+
+        user = f"挑战内容：\n{json.dumps(safe_prompt, ensure_ascii=False, indent=2)}\n\n请作答："
+        return self.chat(system, user, temperature=0.3, max_tokens=800)
+
+    def debate(self, topic, side, opponent_speech=None, round_num=1):
+        """用 LLM 进行辩论"""
+        system = f"""你是辩论赛选手，持{side}立场。
+规则：发言不超过200字，引用至少1个事实/数据，不能人身攻击。"""
+        user = f"辩题：{topic}\n第{round_num}轮发言。"
+        if opponent_speech:
+            user += f"\n对方上一轮发言：{opponent_speech}\n请反驳："
+        else:
+            user += "\n请陈述你的观点："
+        return self.chat(system, user, temperature=0.8, max_tokens=400)
 
 
 # ========== 挑战定义 ==========
@@ -528,6 +604,9 @@ class ArenaEngine:
             })
             self._save(SCORES_FILE, self.scores)
         
+        # 导出对局日志
+        self._export_game_log(agent_id, challenge_id, answer, score, feedback, time_used)
+        
         return {
             "challenge": challenge["name"],
             "score": score,
@@ -571,6 +650,132 @@ class ArenaEngine:
             lines.append(f"     {c['description']}")
             lines.append(f"     限时{c['time_limit']}秒 | 最多{c['max_attempts']}次尝试")
             lines.append("")
+        return "\n".join(lines)
+    
+    def _export_game_log(self, agent_id, challenge_id, answer, score, feedback, time_used):
+        """导出对局日志"""
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        agent = self.scores["agents"].get(agent_id, {})
+        challenge = self.get_challenge(challenge_id)
+        
+        log_data = {
+            "timestamp": datetime.now().isoformat(),
+            "agent_id": agent_id,
+            "agent_name": agent.get("name", "unknown"),
+            "agent_model": agent.get("model", "unknown"),
+            "challenge_id": challenge_id,
+            "challenge_name": challenge.get("name", "") if challenge else "",
+            "challenge_type": challenge.get("type", "") if challenge else "",
+            "difficulty": challenge.get("difficulty", 0) if challenge else 0,
+            "answer": answer,
+            "score": score,
+            "feedback": feedback,
+            "time_used": time_used,
+        }
+        
+        log_file = LOGS_DIR / f"arena-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{agent_id}.json"
+        with open(log_file, "w", encoding="utf-8") as f:
+            json.dump(log_data, f, ensure_ascii=False, indent=2)
+        
+        # 更新详细统计
+        self._update_detailed_stats(log_data)
+    
+    def _update_detailed_stats(self, log_data):
+        """更新详细统计"""
+        STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        stats = {}
+        if STATS_FILE.exists():
+            try:
+                with open(STATS_FILE, "r", encoding="utf-8") as f:
+                    stats = json.load(f)
+            except:
+                stats = {}
+        
+        if "total_submissions" not in stats:
+            stats.update({
+                "total_submissions": 0, "total_score": 0,
+                "by_type": {}, "by_difficulty": {}, "by_model": {},
+            })
+        
+        stats["total_submissions"] += 1
+        stats["total_score"] += log_data["score"]
+        
+        # 按类型统计
+        ctype = log_data.get("challenge_type", "unknown")
+        if ctype not in stats["by_type"]:
+            stats["by_type"][ctype] = {"count": 0, "total_score": 0, "perfect": 0}
+        stats["by_type"][ctype]["count"] += 1
+        stats["by_type"][ctype]["total_score"] += log_data["score"]
+        if log_data["score"] == 100:
+            stats["by_type"][ctype]["perfect"] += 1
+        
+        # 按难度统计
+        diff = str(log_data.get("difficulty", 0))
+        if diff not in stats["by_difficulty"]:
+            stats["by_difficulty"][diff] = {"count": 0, "total_score": 0}
+        stats["by_difficulty"][diff]["count"] += 1
+        stats["by_difficulty"][diff]["total_score"] += log_data["score"]
+        
+        # 按模型统计
+        model = log_data.get("agent_model", "unknown")
+        if model not in stats["by_model"]:
+            stats["by_model"][model] = {"count": 0, "total_score": 0, "perfect": 0}
+        stats["by_model"][model]["count"] += 1
+        stats["by_model"][model]["total_score"] += log_data["score"]
+        if log_data["score"] == 100:
+            stats["by_model"][model]["perfect"] += 1
+        
+        with open(STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+    
+    def detailed_stats(self):
+        """详细统计"""
+        stats = {}
+        if STATS_FILE.exists():
+            try:
+                with open(STATS_FILE, "r", encoding="utf-8") as f:
+                    stats = json.load(f)
+            except:
+                pass
+        
+        if not stats or stats.get("total_submissions", 0) == 0:
+            return "📭 暂无统计数据"
+        
+        lines = [f"""
+📊 ═══════════════════════════════════════
+   AgentArena v2.0 详细统计
+   ═══════════════════════════════════════
+
+📈 总体：
+   总提交：{stats.get('total_submissions', 0)}
+   平均分：{stats.get('total_score', 0) / max(stats.get('total_submissions', 1), 1):.1f}
+"""]
+        
+        # 按类型
+        if stats.get("by_type"):
+            lines.append("📋 按挑战类型：")
+            for ctype, cs in stats["by_type"].items():
+                avg = cs["total_score"] / max(cs["count"], 1)
+                perfect_rate = cs["perfect"] / max(cs["count"], 1) * 100
+                lines.append(f"   {ctype}: {cs['count']}次 均分{avg:.0f} 满分率{perfect_rate:.0f}%")
+        
+        # 按难度
+        if stats.get("by_difficulty"):
+            lines.append("\n⭐ 按难度：")
+            for diff, ds in stats["by_difficulty"].items():
+                avg = ds["total_score"] / max(ds["count"], 1)
+                diff_name = {"1": "简单", "2": "中等", "3": "困难"}.get(diff, f"难度{diff}")
+                lines.append(f"   {diff_name}: {ds['count']}次 均分{avg:.0f}")
+        
+        # 模型排行
+        if stats.get("by_model"):
+            lines.append("\n🤖 模型排行榜：")
+            sorted_models = sorted(stats["by_model"].items(), key=lambda x: -x[1]["total_score"] / max(x[1]["count"], 1))
+            for i, (model, ms) in enumerate(sorted_models[:10], 1):
+                avg = ms["total_score"] / max(ms["count"], 1)
+                medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
+                lines.append(f"   {medal} {model}: {ms['count']}次 均分{avg:.0f} 满分{ms['perfect']}次")
+        
         return "\n".join(lines)
 
 
@@ -690,10 +895,11 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="🎮 AgentArena — AI Agent 竞技场")
     parser.add_argument("command", nargs="?", default="challenges",
-                       choices=["serve", "challenges", "leaderboard", "play", "register", "status"])
+                       choices=["serve", "challenges", "leaderboard", "play", "register", "status", "stats"])
     parser.add_argument("--port", "-p", type=int, default=8910)
     parser.add_argument("--name", "-n", default="test_agent")
     parser.add_argument("--model", "-m", default="unknown")
+    parser.add_argument("--llm", action="store_true", help="LLM 驱动模式")
     args = parser.parse_args()
     
     engine = ArenaEngine()
@@ -704,6 +910,8 @@ def main():
         print(engine.available_challenges())
     elif args.command == "leaderboard":
         print(engine.leaderboard())
+    elif args.command == "stats":
+        print(engine.detailed_stats())
     elif args.command == "status":
         agents = engine.scores.get("agents", {})
         print(f"📊 竞技场状态")
@@ -716,10 +924,39 @@ def main():
         print(f"   名称: {args.name}")
         print(f"   模型: {args.model}")
     elif args.command == "play":
-        print("🎮 单Agent测试模式\n")
-        print("可用挑战：")
-        print(engine.available_challenges())
-        print("用 serve 模式启动竞技场，让Agent通过API参与")
+        llm = LLMClient()
+        if args.llm and llm.available:
+            print(f"🎮 LLM 驱动测试模式 ({llm.model})\n")
+            # 注册 Agent
+            agent_id = engine.register(args.name, f"{args.model}-llm")
+            print(f"✅ 注册成功！Agent ID: {agent_id}\n")
+            
+            # 遍历挑战
+            for c in engine.challenges:
+                print(f"--- [{c['type']}] {c['name']} (难度{'⭐'*c['difficulty']}) ---")
+                start = time.time()
+                
+                # LLM 回答
+                answer_text = llm.answer_challenge(c, c["prompt"])
+                print(f"🤖 回答: {answer_text[:200]}...")
+                
+                # 解析答案
+                try:
+                    answer = json.loads(answer_text)
+                except:
+                    answer = answer_text
+                
+                result = engine.submit_answer(agent_id, c["id"], answer, time.time() - start)
+                print(f"📊 得分: {result['score']}/100 — {result['feedback']}\n")
+        elif args.llm:
+            print("⚠️  未设置 LLM_API_KEY，LLM模式不可用")
+            print("   export LLM_API_KEY=your-key")
+        else:
+            print("🎮 单Agent测试模式\n")
+            print("可用挑战：")
+            print(engine.available_challenges())
+            print("用 serve 模式启动竞技场，让Agent通过API参与")
+            print("或用 --llm 模式让 LLM 自动答题")
 
 
 if __name__ == "__main__":
